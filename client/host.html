@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Collega il telefono — Camera → TouchDesigner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <div class="host">
+    <p class="host__mark">CAM <b>→</b> TD</p>
+
+    <div class="host__qr" id="qr"></div>
+
+    <p class="host__room">stanza<b id="roomCode">····</b></p>
+
+    <p class="host__hint">
+      Apri la fotocamera del telefono e inquadra il codice per collegarti
+      come sorgente video.
+    </p>
+
+    <p class="host__url" id="urlOut"></p>
+  </div>
+
+  <script src="host.js"></script>
+</body>
+</html>

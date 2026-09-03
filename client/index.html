@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Camera → TouchDesigner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <div class="app">
+    <div class="wordmark">
+      <p class="wordmark__title">CAM <b>→</b> TD</p>
+      <div class="readout" id="status" data-state="idle">
+        <span class="readout__dot"></span>
+        <span id="statusLabel">non connesso</span>
+      </div>
+    </div>
+
+    <div class="viewfinder" id="viewfinder">
+      <video id="preview" autoplay playsinline muted></video>
+      <div class="viewfinder__placeholder" id="viewfinderPlaceholder">
+        tocca il pulsante per avviare la trasmissione
+      </div>
+      <span class="corner corner--tl"></span>
+      <span class="corner corner--tr"></span>
+      <span class="corner corner--bl"></span>
+      <span class="corner corner--br"></span>
+      <button id="switchBtn" class="switch-btn" hidden title="Cambia fotocamera" aria-label="Cambia fotocamera">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M17 2l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>
+          <path d="M7 22l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="tally-row">
+      <button id="tallyBtn" class="tally-btn" data-live="false" aria-label="Avvia o interrompi la trasmissione"></button>
+      <span class="tally-label" id="tallyLabel">AVVIA</span>
+    </div>
+
+    <p class="room-readout">stanza <b id="roomLabel">—</b></p>
+
+    <details class="log">
+      <summary>registro eventi</summary>
+      <pre id="logOutput"></pre>
+    </details>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

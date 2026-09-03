@@ -1,0 +1,20 @@
+# Dipendenze
+node_modules/
+package-lock.json
+
+# Certificati di sviluppo: generati in locale, mai versionati
+client/certs/
+*.pem
+*.key
+
+# File di sistema
+.DS_Store
+Thumbs.db
+
+# Log
+*.log
+npm-debug.log*
+
+# Editor
+.vscode/
+.idea/

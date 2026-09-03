@@ -1,0 +1,42 @@
+name: Pubblica il client su GitHub Pages
+
+# Pubblica il contenuto di client/ a ogni push sul ramo principale.
+# Usare un workflow invece della pubblicazione diretta da cartella permette
+# di tenere il client in client/ senza doverlo spostare nella radice o in docs/.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Evita pubblicazioni sovrapposte, senza interrompere quelle già in corso.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scarica il repository
+        uses: actions/checkout@v4
+
+      - name: Configura GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Carica la cartella client
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./client
+
+      - name: Pubblica
+        id: deployment
+        uses: actions/deploy-pages@v4

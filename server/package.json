@@ -1,0 +1,17 @@
+{
+  "name": "signaling-server",
+  "version": "1.0.0",
+  "description": "Signaling server WebRTC per streaming video mobile verso TouchDesigner",
+  "main": "signaling-server.js",
+  "scripts": {
+    "start": "node signaling-server.js",
+    "test": "node test-signaling.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.21.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
