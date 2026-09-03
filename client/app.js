@@ -2,13 +2,20 @@
  * Client web mobile — cattura la fotocamera e la invia via WebRTC
  * al bridge WebRTC→NDI, attraverso il signaling server.
  *
+ * L'avvio è diviso in due fasi indipendenti: se la connessione di rete
+ * fallisce, la fotocamera resta attiva e l'anteprima continua a funzionare,
+ * così è evidente che il problema è la rete e non il dispositivo.
+ *
  * Protocollo di signaling (JSON su WebSocket):
- *   → { type: "join",      room }
+ *   → { type: "join",      room, role }
  *   → { type: "offer",     room, sdp }
  *   → { type: "candidate", room, candidate }
+ *   ← { type: "joined",    room, role, peerPresent }
+ *   ← { type: "peer-joined" }
  *   ← { type: "answer",    sdp }
  *   ← { type: "candidate", candidate }
  *   ← { type: "peer-left" }
+ *   ← { type: "error",     message }
  */
 
 const els = {
@@ -49,6 +56,20 @@ function setStatus(state, label) {
 
 function resolveSignalingUrl() {
   if (APP_CONFIG.signalingUrl) return APP_CONFIG.signalingUrl;
+
+  // Senza signalingUrl esplicito l'indirizzo viene dedotto dall'host corrente.
+  // Ha senso solo in sviluppo locale: su un hosting statico (GitHub Pages)
+  // non esiste alcun WebSocket da contattare, quindi conviene dirlo subito
+  // invece di lasciar fallire la connessione con un errore generico.
+  const isLocal = ["localhost", "127.0.0.1"].includes(location.hostname) ||
+                  /^192\.168\.|^10\.|^172\.(1[6-9]|2\d|3[01])\./.test(location.hostname);
+
+  if (!isLocal) {
+    const err = new Error("Signaling server non configurato");
+    err.code = "SIGNALING_NOT_CONFIGURED";
+    throw err;
+  }
+
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${location.host}/ws`;
 }
@@ -71,33 +92,64 @@ async function start() {
   els.tallyBtn.disabled = true;
   isStopping = false;
 
+  // Fase 1 — fotocamera. Se fallisce qui, non c'è niente da trasmettere.
   try {
     setStatus("connecting", "accesso alla fotocamera…");
     localStream = await openCamera(currentFacingMode);
-
     els.preview.srcObject = localStream;
     els.viewfinder.classList.add("is-active");
-
-    setStatus("connecting", "connessione al signaling…");
-    await connectSignaling();
-
-    await createPeerConnectionAndOffer();
-
     setLive(true);
     els.switchBtn.hidden = false;
+    log("Fotocamera attiva:", describeTrack(localStream));
   } catch (err) {
-    log("Errore in avvio:", err.message || String(err));
-    setStatus("error", humanizeError(err));
+    log("Errore fotocamera:", err.name || "", err.message || String(err));
+    setStatus("error", cameraError(err));
     cleanup();
+    els.tallyBtn.disabled = false;
+    return;
   } finally {
     els.tallyBtn.disabled = false;
   }
+
+  // Fase 2 — connessione. Un fallimento qui NON deve spegnere la fotocamera:
+  // l'anteprima resta attiva e l'utente vede che la cattura funziona,
+  // mentre lo stato segnala il problema di connessione.
+  try {
+    setStatus("connecting", "connessione al signaling…");
+    await connectSignaling();
+    await createPeerConnectionAndOffer();
+  } catch (err) {
+    if (err.code === "SIGNALING_NOT_CONFIGURED") {
+      log("La fotocamera funziona regolarmente.");
+      log("Manca però l'indirizzo del signaling server: impostare");
+      log("signalingUrl in config.js (es. wss://mio-signaling.onrender.com/ws).");
+      setStatus("error", "signaling non configurato");
+    } else {
+      log("Errore di connessione:", err.message || String(err));
+      setStatus("error", "signaling non raggiungibile");
+    }
+    closeConnection();
+  }
 }
 
-function humanizeError(err) {
-  if (err && err.name === "NotAllowedError") return "permesso fotocamera negato";
-  if (err && err.name === "NotFoundError") return "nessuna fotocamera trovata";
-  return "errore di connessione";
+function describeTrack(stream) {
+  const s = stream.getVideoTracks()[0]?.getSettings?.() || {};
+  return `${s.width || "?"}×${s.height || "?"} @ ${s.frameRate || "?"}fps`;
+}
+
+function cameraError(err) {
+  switch (err && err.name) {
+    case "NotAllowedError":
+      return "permesso fotocamera negato";
+    case "NotFoundError":
+      return "nessuna fotocamera trovata";
+    case "NotReadableError":
+      return "fotocamera occupata da un'altra app";
+    case "OverconstrainedError":
+      return "risoluzione non supportata";
+    default:
+      return "errore fotocamera";
+  }
 }
 
 async function openCamera(facingMode) {
@@ -114,7 +166,10 @@ function connectSignaling() {
     log("Connessione al signaling server:", url);
     ws = new WebSocket(url);
 
+    let opened = false;
+
     ws.onopen = () => {
+      opened = true;
       send({ type: "join", room: roomId, role: "client" });
       resolve();
     };
@@ -122,7 +177,10 @@ function connectSignaling() {
     ws.onerror = () => reject(new Error("Impossibile raggiungere il signaling server"));
 
     ws.onclose = () => {
-      if (!isStopping) {
+      // Solo una connessione che era stata stabilita può dirsi "persa":
+      // altrimenti il messaggio sovrascriverebbe l'errore più preciso
+      // già mostrato da chi ha chiamato questa funzione.
+      if (!isStopping && opened) {
         log("Connessione al signaling server chiusa inaspettatamente");
         setStatus("error", "connessione persa");
       }
@@ -221,7 +279,8 @@ function stop() {
   els.viewfinder.classList.remove("is-active");
 }
 
-function cleanup() {
+/** Chiude solo la parte di rete, lasciando la fotocamera attiva. */
+function closeConnection() {
   if (pc) {
     pc.close();
     pc = null;
@@ -230,6 +289,10 @@ function cleanup() {
     ws.close();
     ws = null;
   }
+}
+
+function cleanup() {
+  closeConnection();
   if (localStream) {
     localStream.getTracks().forEach(t => t.stop());
     localStream = null;
