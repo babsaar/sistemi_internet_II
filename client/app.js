@@ -74,6 +74,24 @@ function resolveSignalingUrl() {
   return `${proto}//${location.host}/ws`;
 }
 
+/**
+ * Aggiorna l'anteprima in base alla fotocamera in uso: quella frontale
+ * viene mostrata specchiata (vedi style.css). Non altera il flusso inviato.
+ */
+function updateFacingIndicator() {
+  els.viewfinder.dataset.facing = currentFacingMode;
+}
+
+/**
+ * Adatta il mirino alle proporzioni reali del fotogramma catturato.
+ * Con proporzioni fisse l'anteprima ritaglierebbe l'immagine, mostrando
+ * qualcosa di diverso da ciò che viene effettivamente trasmesso.
+ */
+function matchViewfinderToVideo() {
+  const { videoWidth: w, videoHeight: h } = els.preview;
+  if (w && h) els.viewfinder.style.aspectRatio = `${w} / ${h}`;
+}
+
 function setLive(live) {
   isLive = live;
   els.tallyBtn.dataset.live = String(live);
@@ -98,6 +116,7 @@ async function start() {
     localStream = await openCamera(currentFacingMode);
     els.preview.srcObject = localStream;
     els.viewfinder.classList.add("is-active");
+    updateFacingIndicator();
     setLive(true);
     els.switchBtn.hidden = false;
     log("Fotocamera attiva:", describeTrack(localStream));
@@ -268,6 +287,7 @@ async function switchCamera() {
   localStream.removeTrack(oldTrack);
   localStream.addTrack(newTrack);
   els.preview.srcObject = localStream;
+  updateFacingIndicator();
 }
 
 function stop() {
@@ -277,6 +297,8 @@ function stop() {
   setStatus("idle", "non connesso");
   els.switchBtn.hidden = true;
   els.viewfinder.classList.remove("is-active");
+  delete els.viewfinder.dataset.facing;
+  els.viewfinder.style.removeProperty("aspect-ratio");
 }
 
 /** Chiude solo la parte di rete, lasciando la fotocamera attiva. */
@@ -298,6 +320,9 @@ function cleanup() {
     localStream = null;
   }
 }
+
+els.preview.addEventListener("loadedmetadata", matchViewfinderToVideo);
+els.preview.addEventListener("resize", matchViewfinderToVideo);
 
 els.tallyBtn.addEventListener("click", () => toggle().catch(err => log("Errore:", err.message)));
 els.switchBtn.addEventListener("click", () => switchCamera().catch(err => log("Errore cambio camera:", err.message)));
