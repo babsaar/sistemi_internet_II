@@ -4,7 +4,7 @@ const APP_CONFIG = {
   // Indirizzo del signaling server. In produzione deve essere wss:// (WebSocket sicuro).
   // Se non specificato, viene derivato automaticamente dall'host corrente
   // (utile quando client e signaling server sono serviti dallo stesso dominio).
-  signalingUrl:"wss://signaling-jesse-sistemi.onrender.com/ws"
+  signalingUrl:"wss://signaling-jesse-sistemi.onrender.com/ws",
   //wss://mio-dominio.example/ws"
   // Identificativo di stanza/sessione di default: permette al signaling server
   // di instradare correttamente offerta/risposta verso il bridge corretto,
