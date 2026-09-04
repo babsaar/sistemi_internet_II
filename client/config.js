@@ -6,7 +6,6 @@ const APP_CONFIG = {
   // (utile quando client e signaling server sono serviti dallo stesso dominio).
   signalingUrl:"wss://signaling-jesse-sistemi.onrender.com/ws"
   //wss://mio-dominio.example/ws"
-
   // Identificativo di stanza/sessione di default: permette al signaling server
   // di instradare correttamente offerta/risposta verso il bridge corretto,
   // utile se più client si collegano contemporaneamente.
