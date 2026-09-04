@@ -1,0 +1,14 @@
+# Dipendenze del bridge — macOS Apple Silicon, Windows, Linux
+#
+# Su queste piattaforme ndi-python è aggiornato e non impone i vincoli
+# necessari su Mac Intel (vedi requirements-intel.txt).
+#
+# Installazione:
+#   python3 -m venv venv
+#   source venv/bin/activate
+#   pip install -r requirements.txt
+
+ndi-python>=6.3
+numpy>=1.23
+aiortc>=1.13
+websockets>=12

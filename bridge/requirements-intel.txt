@@ -1,0 +1,26 @@
+# Dipendenze del bridge — versioni per macOS Intel (x86_64) con Python 3.10
+#
+# Il vincolo di partenza è ndi-python: su Mac Intel l'ultima versione con
+# binari precompilati è la 5.1.1.1, che arriva fino a Python 3.10.
+# Da lì discendono gli altri limiti.
+#
+# Installazione:
+#   python3.10 -m venv venv
+#   source venv/bin/activate
+#   pip install -r requirements-intel.txt
+
+# Binding NDI: unica versione con wheel per macOS x86_64
+ndi-python==5.1.1.1
+
+# Compilata nel 2022 contro numpy 1.x: con numpy 2.x l'interfaccia binaria
+# potrebbe non combaciare, quindi restiamo sulla serie 1.
+numpy>=1.23,<2
+
+# WebRTC lato Python
+aiortc==1.15.0
+
+# Dalla versione 49 non pubblica più binari per macOS Intel
+cryptography<49
+
+# Client WebSocket per il signaling
+websockets>=12,<16
