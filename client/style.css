@@ -87,7 +87,10 @@ html, body {
 /* Mirino con angoli da viewfinder */
 .viewfinder {
   position: relative;
-  aspect-ratio: 9 / 16;
+  /* Proporzioni di partenza; vengono sostituite via JS con quelle reali
+     del fotogramma, cosÃ¬ l'anteprima mostra esattamente ciÃ² che viene
+     trasmesso invece di un ritaglio fuorviante. */
+  aspect-ratio: 3 / 4;
   max-height: 58vh;
   background: var(--surface);
   border-radius: 4px;
@@ -100,13 +103,21 @@ html, body {
 .viewfinder video {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
   display: none;
 }
 
 .viewfinder.is-active video { display: block; }
 .viewfinder.is-active .viewfinder__placeholder { display: none; }
 .viewfinder.is-active .corner { border-color: var(--signal); }
+
+/* La fotocamera frontale va vista come allo specchio: senza questo,
+   ogni movimento appare invertito ed Ã¨ disorientante.
+   Riguarda solo l'anteprima locale: il flusso inviato via WebRTC
+   mantiene l'orientamento reale, che Ã¨ quello che serve a TouchDesigner. */
+.viewfinder[data-facing="user"] video {
+  transform: scaleX(-1);
+}
 
 .viewfinder__placeholder {
   color: var(--text-muted);
@@ -143,6 +154,170 @@ html, body {
   color: var(--text);
   display: flex;
   align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.switch-btn svg { width: 19px; height: 19px; }
+
+/* Controllo principale: tally button */
+.tally-row {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0 2px;
+}
+
+.tally-btn {
+  appearance: none;
+  border: none;
+  cursor: pointer;
+  width: 76px;
+  height: 76px;
+  border-radius: 50%;
+  background: var(--surface-alt);
+  border: 3px solid var(--border);
+  position: relative;
+  transition: border-color .2s ease, transform .1s ease;
+}
+
+.tally-btn::after {
+  content: "";
+  position: absolute;
+  inset: 12px;
+  border-radius: 50%;
+  background: var(--tally);
+  transition: inset .18s ease, border-radius .18s ease;
+}
+
+.tally-btn[data-live="true"] {
+  border-color: var(--tally);
+}
+.tally-btn[data-live="true"]::after {
+  inset: 24px;
+  border-radius: 8px;
+}
+
+.tally-btn:active { transform: scale(0.96); }
+.tally-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.tally-label {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.room-readout {
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.room-readout b { color: var(--text); letter-spacing: 0.08em; }
+
+.log {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 9px 13px;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: auto;
+}
+
+.log summary {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.log pre {
+  margin: 9px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 140px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+
+/* ---------- Pagina host (QR, da mostrare su monitor) ---------- */
+
+.host {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 28px;
+  padding: 40px 24px;
+  text-align: center;
+}
+
+.host__mark {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+}
+.host__mark b { color: var(--signal); }
+
+.host__qr {
+  background: #fff;
+  padding: 18px;
+  border-radius: 4px;
+  width: 300px;
+  height: 300px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.host__room {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  color: var(--text-muted);
+}
+.host__room b {
+  display: block;
+  font-size: 40px;
+  letter-spacing: 0.12em;
+  color: var(--text);
+  margin-top: 4px;
+}
+
+.host__hint {
+  max-width: 320px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.host__url {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  word-break: break-all;
+  max-width: 340px;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+
+
+.host__warning {
+  max-width: 340px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--amber);
+  border: 1px solid var(--amber-dim);
+  background: rgba(255, 176, 32, 0.06);
+  border-radius: 4px;
+  padding: 12px 14px;
+  margin: 0;
+}  align-items: center;
   justify-content: center;
   cursor: pointer;
 }
