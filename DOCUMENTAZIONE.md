@@ -72,7 +72,7 @@ attraverso il signaling server, ma il video poi viaggia direttamente tra loro.
 | **Pagina QR (host)** | Browser di un laptop/monitor | Genera codice stanza e QR per collegare il telefono | ✅ Fatto |
 | **Signaling server** | Servizio online (o locale) | Inoltra offerte/risposte SDP e candidati ICE tra i peer | ✅ Fatto |
 | **STUN / TURN** | Server pubblico | Attraversamento NAT; fa da relay se la connessione diretta non è possibile | ⬜ Da configurare |
-| **Bridge WebRTC → NDI** | Tuo computer, accanto a TD | Riceve il video WebRTC e lo ripubblica come sorgente NDI | ⬜ Da scrivere |
+| **Bridge WebRTC → NDI** | Tuo computer, accanto a TD | Riceve il video WebRTC e lo ripubblica come sorgente NDI | ✅ Fatto |
 
 ### Perché serve un bridge
 
@@ -114,11 +114,18 @@ progetto/
 │   └── vendor/
 │       └── qrcode.min.js       libreria QR (MIT, inclusa localmente)
 │
-└── server/                     ← signaling server (da pubblicare online)
-    ├── signaling-server.js     il server
-    ├── test-signaling.js       test automatici dell'inoltro messaggi
-    ├── test-origins.js         test del filtro sulle origini
-    └── package.json
+├── server/                     ← signaling server (pubblicato su Render)
+│   ├── signaling-server.js     il server
+│   ├── test-signaling.js       test automatici dell'inoltro messaggi
+│   ├── test-origins.js         test del filtro sulle origini
+│   └── package.json
+│
+└── bridge/                     ← bridge WebRTC → NDI (gira accanto a TouchDesigner)
+    ├── bridge.py               il bridge
+    ├── fake_client.py          telefono simulato, per le prove senza dispositivo
+    ├── requirements-intel.txt  ⚙️ dipendenze per macOS Intel
+    ├── requirements.txt        dipendenze per Apple Silicon / Windows / Linux
+    └── README.md               guida all'installazione del bridge
 ```
 
 ---
@@ -139,7 +146,7 @@ L'unica eccezione è `localhost`, che però non si applica quando il telefono
 raggiunge il computer tramite indirizzo di rete locale.
 
 Conseguenze pratiche:
-- in rete locale serve un certificato (anche autofirmato, vedi §7);
+- in rete locale serve un certificato (anche autofirmato, vedi §8);
 - pubblicando su GitHub Pages il problema scompare, perché fornisce HTTPS valido.
 
 ### L'interfaccia
@@ -277,7 +284,82 @@ minima di sicurezza per un sistema che trasmette video su Internet.
 
 ---
 
-## 7. Come eseguire il progetto in locale
+## 7. Il bridge WebRTC → NDI
+
+È il traduttore fra due mondi: riceve WebRTC (protocollo web) e produce NDI
+(protocollo video professionale). Gira sulla stessa macchina di TouchDesigner,
+perché NDI non attraversa Internet.
+
+### Come funziona
+
+1. Si collega **in uscita** al signaling server ed entra nella stanza con
+   ruolo `bridge`. Essendo lui a iniziare la connessione, non servono porte
+   aperte né configurazione del router.
+2. Alla ricezione dell'offerta SDP del telefono, crea una `RTCPeerConnection`
+   con aiortc, imposta la descrizione remota, genera la risposta e la rimanda
+   indietro.
+3. Quando arriva la traccia video, legge i fotogrammi in un ciclo, li converte
+   in **BGRA** (il formato che corrisponde al FourCC `BGRX` usato da NDI) e li
+   passa alla libreria NDI.
+4. TouchDesigner vede la sorgente comparire nel menu *Source* dell'NDI In TOP.
+
+### Perché aiortc invece di Node.js
+
+Il client e il signaling server sono in JavaScript, quindi la scelta naturale
+sarebbe stata Node.js anche qui. Il problema è che le librerie WebRTC per Node
+(`wrtc`, `mediasoup`) hanno un supporto irregolare su macOS, specialmente per
+le architetture meno recenti. `aiortc` è invece un'implementazione WebRTC in
+Python matura e multipiattaforma, e i binding NDI per Python esistono e sono
+mantenuti. Il costo è avere due linguaggi nel progetto; il beneficio è che il
+componente più delicato gira davvero.
+
+### Nota sui candidati ICE
+
+Il client del browser usa il *trickle ICE*: invia i candidati man mano che li
+scopre, in messaggi separati. aiortc non lo fa: raccoglie tutti i candidati
+prima di completare `setLocalDescription`, per cui sono già contenuti nella
+risposta SDP. Il bridge quindi **riceve** candidati separati dal telefono ma
+non ne **invia**. È una differenza di comportamento legittima fra le due
+implementazioni, e non impedisce la connessione.
+
+### Vincoli su macOS Intel
+
+Questa è la parte più insidiosa e vale la pena documentarla, perché non è
+evidente prima di sbatterci contro.
+
+I binding `ndi-python` pubblicano binari precompilati per macOS x86_64 solo
+fino alla versione **5.1.1.1** (marzo 2022), che supporta al massimo
+**Python 3.10**. Da questo vincolo iniziale discende tutto il resto:
+
+| Pacchetto | Vincolo su Mac Intel | Motivo |
+|---|---|---|
+| `ndi-python` | `==5.1.1.1` | Ultima versione con binari x86_64 |
+| Python | `3.10` | Massima versione supportata da ndi-python 5.1.1.1 |
+| `numpy` | `<2` | ndi-python è compilato contro numpy 1.x |
+| `cryptography` | `<49` | Dalla 49 non pubblica più binari per macOS Intel |
+| `aiortc` | `1.15.0` | Compatibile con Python 3.10 e Intel |
+
+Su Apple Silicon nulla di tutto questo si applica: si usa `requirements.txt`
+con le versioni recenti.
+
+### Modalità di prova
+
+Il bridge ha due strumenti pensati per isolare i guasti:
+
+- `--dry-run` esegue tutto tranne la pubblicazione NDI. Se funziona in dry-run
+  ma non senza, il problema è nella parte NDI e non nella rete.
+- `fake_client.py` simula il telefono inviando un video sintetico (una barra
+  bianca che scorre su fondo verde). Permette di provare la catena senza
+  dispositivi reali, e di distinguere un problema del telefono da uno del
+  sistema.
+
+La sequenza di verifica consigliata è: prima `--dry-run` con il client
+simulato, poi senza `--dry-run` sempre col client simulato (verifica NDI in
+TouchDesigner), e solo alla fine il telefono vero.
+
+---
+
+## 8. Come eseguire il progetto in locale
 
 ### Prerequisiti
 
@@ -349,17 +431,33 @@ Telefono e computer sulla **stessa rete WiFi**. Inquadra il QR con l'app
 Fotocamera, tocca il link, accetta l'avviso sul certificato. Su iOS Safari
 l'avviso è più insistente: *Mostra dettagli → Visita questo sito web*.
 
-### Passo 7 — Avviare la trasmissione
+### Passo 7 — Avviare il bridge
 
-Tocca il pulsante rosso e concedi il permesso della fotocamera. Devi vedere
-l'anteprima nel mirino e, nello stato in alto, `in attesa del bridge…`
+In un terzo terminale, dalla cartella `bridge/` (vedi il suo README per
+l'installazione delle dipendenze):
 
-**Questo è il punto di arrivo attuale**: il bridge non esiste ancora, quindi il
-video non arriva a TouchDesigner. Tutto il resto della catena è verificabile.
+```bash
+source venv/bin/activate
+python bridge.py --signaling ws://localhost:8080/ws --room XXXX
+```
+
+Il codice stanza deve essere **lo stesso** mostrato dalla pagina QR.
+
+### Passo 8 — Collegare TouchDesigner
+
+Crea un **NDI In TOP** e seleziona nel parametro *Source* la sorgente
+pubblicata dal bridge (di default `Camera Mobile`). Verifica che il parametro
+*Active* sia attivo.
+
+### Passo 9 — Avviare la trasmissione
+
+Sul telefono, tocca il pulsante rosso e concedi il permesso della fotocamera.
+Lo stato deve passare a `in diretta` in verde, e l'immagine comparire
+nell'NDI In TOP.
 
 ---
 
-## 8. Problemi frequenti
+## 9. Problemi frequenti
 
 | Sintomo | Causa | Soluzione |
 |---|---|---|
@@ -369,12 +467,17 @@ video non arriva a TouchDesigner. Tutto il resto della catena è verificabile.
 | Il QR non funziona dal telefono | L'URL nel QR contiene `localhost` | Riavvia `serve-dev.js` e ricarica; controlla l'URL sotto il QR |
 | Il telefono non raggiunge la pagina | Firewall del computer | Impostazioni → Rete → Firewall: consenti le connessioni per Node |
 | Il telefono non raggiunge la pagina | Isolamento client sulla rete WiFi (comune nelle reti universitarie) | Usa l'hotspot del telefono e collegaci il computer |
-| Stato bloccato su "in attesa del bridge" | Il bridge non esiste ancora | Atteso: è il prossimo componente da scrivere |
+| Stato bloccato su "in attesa del bridge" | Il bridge non è in esecuzione, o è in una stanza diversa | Verifica che il codice stanza passato a `bridge.py` sia identico a quello della pagina QR |
+| "signaling non configurato" sul telefono | `signalingUrl` non impostato in `config.js` | Inserire l'indirizzo `wss://…/ws` del signaling server |
+| Il bridge termina con timeout all'avvio | Servizio di hosting sospeso per inattività | Aprire `/health` nel browser per risvegliarlo; il bridge riprova comunque da solo |
+| `ModuleNotFoundError: NDIlib` | NDI SDK assente, o versione di Python senza binari | Su Mac Intel servono Python 3.10 e `ndi-python==5.1.1.1` |
+| La sorgente NDI non compare in TouchDesigner | Firewall di macOS, o bridge su rete diversa | Consentire le connessioni per Python; NDI si annuncia via mDNS in rete locale |
+| Il bridge riceve "Origine non ammessa" | `--origin` non incluso in `ALLOWED_ORIGINS` | Allineare i due valori sul servizio di hosting |
 | Immagine a scatti o molto in ritardo | Banda insufficiente o relay TURN sovraccarico | Abbassa risoluzione/frame rate in `config.js` |
 
 ---
 
-## 9. Pubblicazione online
+## 10. Pubblicazione online
 
 Pubblicare risolve in un colpo il problema del certificato, l'isolamento della
 rete WiFi e il firewall — e consente l'uso da qualsiasi rete.
@@ -406,26 +509,29 @@ classe di problemi più fastidiosa.
 
 ---
 
-## 10. Stato del progetto e prossimi passi
+## 11. Stato del progetto e prossimi passi
 
 ### Completato
 
-- Client web mobile: cattura fotocamera, WebRTC, inversione camera, interfaccia.
+- Client web mobile: cattura fotocamera, WebRTC, inversione camera con
+  anteprima specchiata, mirino adattato alle proporzioni reali del fotogramma.
 - Pagina QR con generazione codice stanza.
 - Server HTTPS locale per le prove in rete locale.
 - Signaling server: stanze, ruoli, inoltro, buffering, heartbeat, filtro origini.
 - Test automatici del signaling server (14 controlli).
+- Bridge WebRTC → NDI in Python, con modalità di prova senza NDI e telefono
+  simulato per le verifiche.
+- **Pubblicazione**: client su GitHub Pages, signaling server su Render.
+- **Verifica end-to-end riuscita**: video della fotocamera del telefono
+  ricevuto dentro TouchDesigner attraverso Internet.
 - Documentazione tecnica in italiano e inglese (PDF).
 
 ### Da fare
 
-1. **Pubblicazione**: repository Git, client su GitHub Pages, server su hosting.
-2. **Server TURN**: coturn su VPS, oppure servizio TURN gestito.
-3. **Bridge WebRTC → NDI**: il componente più delicato. Opzioni praticabili:
-   Node.js con `wrtc`/`mediasoup` + binding NDI SDK, oppure Python con
-   `aiortc` + librerie NDI.
-4. **Verifica end-to-end**: telefono su rete dati → video dentro TouchDesigner.
-5. **Misure di latenza** per la relazione d'esame.
+1. **Server TURN**: necessario perché la connessione funzioni anche con
+   telefono e computer su reti diverse (es. telefono su rete dati). Con
+   entrambi sulla stessa WiFi il solo STUN è sufficiente.
+2. **Misure di latenza** per la parte di analisi della relazione.
 
 ### Possibili estensioni
 
@@ -435,7 +541,7 @@ classe di problemi più fastidiosa.
 
 ---
 
-## 11. Riferimenti
+## 12. Riferimenti
 
 - W3C — *WebRTC: Real-Time Communication in Browsers* (specifica ufficiale)
 - IETF RFC 8445 — *Interactive Connectivity Establishment (ICE)*
