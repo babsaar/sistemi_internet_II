@@ -146,31 +146,67 @@ async def consume_track(track, output, stats):
 # Sessione: signaling + connessione WebRTC
 # --------------------------------------------------------------------------
 
-async def run_session(args, output):
-    ice_servers = [RTCIceServer(urls=[u]) for u in args.stun]
+def ice_servers_from_args(args):
+    """Server ICE indicati a riga di comando."""
+    servers = [RTCIceServer(urls=[u]) for u in args.stun]
     if args.turn:
-        ice_servers.append(RTCIceServer(
+        servers.append(RTCIceServer(
             urls=[args.turn], username=args.turn_user, credential=args.turn_password))
+    return servers
 
-    pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
+
+def ice_servers_from_signaling(entries):
+    """
+    Converte l'elenco consegnato dal signaling server, nello stesso formato
+    usato dai browser: [{urls, username?, credential?}, …].
+    """
+    servers = []
+    for entry in entries or []:
+        urls = entry.get("urls") or entry.get("url")
+        if not urls:
+            continue
+        servers.append(RTCIceServer(
+            urls=urls,
+            username=entry.get("username"),
+            credential=entry.get("credential")))
+    return servers
+
+
+async def run_session(args, output):
     stats = {"frames": 0, "width": 0, "height": 0,
              "started": time.monotonic(), "first_frame_at": None}
     finished = asyncio.Event()
+    pc = None
 
-    @pc.on("track")
-    def on_track(track):
-        if track.kind == "video":
-            asyncio.ensure_future(consume_track(track, output, stats))
+    def create_peer_connection(ice_servers):
+        nonlocal pc
+        pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
 
-    @pc.on("connectionstatechange")
-    async def on_state_change():
-        log.info("Stato della connessione: %s", pc.connectionState)
-        if pc.connectionState in ("failed", "closed", "disconnected"):
-            finished.set()
+        @pc.on("track")
+        def on_track(track):
+            if track.kind == "video":
+                asyncio.ensure_future(consume_track(track, output, stats))
+
+        @pc.on("connectionstatechange")
+        async def on_state_change():
+            state = pc.connectionState
+            log.info("Stato della connessione: %s", state)
+            # "disconnected" è spesso transitorio e il client può tentare un
+            # ICE restart: chiudere qui la sessione impedirebbe il ripristino.
+            if state in ("failed", "closed"):
+                finished.set()
+            elif state == "disconnected":
+                log.info("Interruzione temporanea; in attesa di un eventuale ripristino.")
+
+        return pc
 
     log.info("Connessione al signaling server: %s", args.signaling)
 
-    async with websockets.connect(args.signaling, origin=args.origin) as ws:
+    # open_timeout generoso: sui piani gratuiti il servizio va in sospensione
+    # dopo un periodo di inattività e il primo collegamento deve attendere
+    # il risveglio, che può richiedere un minuto abbondante.
+    async with websockets.connect(args.signaling, origin=args.origin,
+                                  open_timeout=args.connect_timeout) as ws:
         await ws.send(json.dumps({"type": "join", "room": args.room, "role": "bridge"}))
         log.info("Entrato nella stanza %s in attesa del telefono…", args.room)
 
@@ -182,12 +218,26 @@ async def run_session(args, output):
                 if kind == "joined":
                     log.info("Join confermato (telefono già presente: %s)",
                              "sì" if msg.get("peerPresent") else "no")
+                    # I server ICE del signaling hanno la precedenza, a meno
+                    # che non ne sia stato indicato uno esplicitamente.
+                    from_signaling = ice_servers_from_signaling(msg.get("iceServers"))
+                    if from_signaling and not args.turn:
+                        log.info("Server ICE ricevuti dal signaling: %d", len(from_signaling))
+                        create_peer_connection(from_signaling)
+                    else:
+                        create_peer_connection(ice_servers_from_args(args))
 
                 elif kind == "peer-joined":
                     log.info("Il telefono si è collegato.")
 
                 elif kind == "offer":
-                    log.info("Offerta ricevuta dal telefono, preparo la risposta.")
+                    if pc is None:
+                        create_peer_connection(ice_servers_from_args(args))
+                    # Una seconda offerta sulla stessa sessione è una
+                    # rinegoziazione (tipicamente un ICE restart del client).
+                    log.info("Offerta ricevuta dal telefono, preparo la risposta."
+                             if pc.remoteDescription is None
+                             else "Nuova offerta ricevuta: rinegoziazione in corso.")
                     await pc.setRemoteDescription(
                         RTCSessionDescription(sdp=msg["sdp"]["sdp"], type=msg["sdp"]["type"]))
                     answer = await pc.createAnswer()
@@ -203,6 +253,8 @@ async def run_session(args, output):
                     log.info("Risposta inviata.")
 
                 elif kind == "candidate":
+                    if pc is None:
+                        continue
                     cand = msg.get("candidate") or {}
                     raw_cand = cand.get("candidate")
                     if not raw_cand:
@@ -230,7 +282,8 @@ async def run_session(args, output):
             await finished.wait()
         finally:
             reader.cancel()
-            await pc.close()
+            if pc is not None:
+                await pc.close()
 
     if stats["frames"]:
         elapsed = max(time.monotonic() - stats["first_frame_at"], 1e-6)
@@ -247,8 +300,12 @@ async def main_loop(args):
         while True:
             try:
                 await run_session(args, output)
-            except (OSError, websockets.exceptions.WebSocketException) as err:
-                log.warning("Signaling non raggiungibile (%s).", err)
+            except (OSError, asyncio.TimeoutError,
+                    websockets.exceptions.WebSocketException) as err:
+                detail = str(err) or type(err).__name__
+                log.warning("Signaling non raggiungibile: %s", detail)
+                log.warning("Se il servizio è ospitato su un piano gratuito potrebbe "
+                            "essere sospeso: il risveglio richiede fino a un minuto.")
 
             if args.once:
                 return
@@ -277,6 +334,8 @@ def parse_args(argv=None):
                    help="Non pubblica su NDI: utile per verificare signaling e WebRTC")
     p.add_argument("--once", action="store_true",
                    help="Termina dopo una sessione invece di restare in attesa")
+    p.add_argument("--connect-timeout", type=int, default=90,
+                   help="Secondi di attesa per l'handshake WebSocket (default: 90)")
     p.add_argument("--retry", type=int, default=5,
                    help="Secondi di attesa prima di ricollegarsi (default: 5)")
     p.add_argument("--verbose", action="store_true", help="Log dettagliato")

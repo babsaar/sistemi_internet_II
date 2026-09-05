@@ -27,11 +27,22 @@ const els = {
   tallyLabel: document.getElementById("tallyLabel"),
   switchBtn: document.getElementById("switchBtn"),
   roomLabel: document.getElementById("roomLabel"),
+  quality: document.getElementById("quality"),
+  statsReadout: document.getElementById("statsReadout"),
   logOutput: document.getElementById("logOutput"),
 };
 
 let ws = null;
 let pc = null;
+// Server ICE consegnati dal signaling server al momento del join.
+// Tenerli lì invece che in config.js evita di pubblicare le credenziali
+// TURN in un repository statico e pubblico.
+let serverIceServers = null;
+let onJoined = null;
+let wakeLock = null;
+let statsTimer = null;
+let reconnectAttempts = 0;
+let currentQuality = null;
 let localStream = null;
 let currentFacingMode = "environment";
 let isStopping = false;
@@ -41,6 +52,11 @@ let isLive = false;
 // se presente in URL, sovrascrive il valore di default in config.js.
 const roomId = new URLSearchParams(location.search).get("room") || APP_CONFIG.roomId;
 els.roomLabel.textContent = roomId;
+
+currentQuality = APP_CONFIG.defaultQuality || "medium";
+for (const btn of document.querySelectorAll("#quality button")) {
+  btn.classList.toggle("is-active", btn.dataset.preset === currentQuality);
+}
 
 function log(...args) {
   const line = args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
@@ -92,6 +108,87 @@ function matchViewfinderToVideo() {
   if (w && h) els.viewfinder.style.aspectRatio = `${w} / ${h}`;
 }
 
+/**
+ * Legge periodicamente le statistiche della connessione.
+ * Servono a capire cosa succede prima di una caduta: un calo del bitrate
+ * indica congestione, la perdita di pacchetti una rete instabile, un
+ * bitrate che va a zero una sospensione della pagina.
+ */
+function startStats() {
+  stopStats();
+  let lastBytes = 0;
+  let lastAt = 0;
+
+  statsTimer = setInterval(async () => {
+    if (!pc) return;
+    const report = await pc.getStats();
+    let bytes = 0, lost = 0, w = 0, h = 0, fps = 0;
+
+    report.forEach(entry => {
+      if (entry.type === "outbound-rtp" && entry.kind === "video") {
+        bytes = entry.bytesSent || 0;
+        w = entry.frameWidth || 0;
+        h = entry.frameHeight || 0;
+        fps = entry.framesPerSecond || 0;
+      }
+      if (entry.type === "remote-inbound-rtp" && entry.kind === "video") {
+        lost = entry.packetsLost || 0;
+      }
+    });
+
+    const now = Date.now();
+    if (lastAt) {
+      const kbps = Math.round(((bytes - lastBytes) * 8) / (now - lastAt));
+      els.statsReadout.textContent = `${w}×${h} · ${Math.round(fps)}fps · ${kbps} kbps`;
+      if (kbps === 0) log("Nessun dato inviato nell'ultimo intervallo.");
+      if (lost > 0) log(`Pacchetti persi finora: ${lost}`);
+    }
+    lastBytes = bytes;
+    lastAt = now;
+  }, 5000);
+}
+
+function stopStats() {
+  if (statsTimer) {
+    clearInterval(statsTimer);
+    statsTimer = null;
+  }
+  els.statsReadout.textContent = "—";
+}
+
+/**
+ * Ripristina la connessione senza rifare tutto da capo.
+ * Un ICE restart rinegozia solo il percorso di rete mantenendo la
+ * fotocamera attiva e la sessione aperta: è il rimedio corretto quando
+ * si cambia rete o il percorso corrente smette di funzionare.
+ */
+async function restartIce() {
+  if (!pc || isStopping) return;
+
+  if (reconnectAttempts >= APP_CONFIG.maxReconnectAttempts) {
+    log("Tentativi di ripristino esauriti.");
+    setStatus("error", "connessione persa");
+    return;
+  }
+
+  reconnectAttempts += 1;
+  const delay = Math.min(1000 * 2 ** (reconnectAttempts - 1), 8000);
+  log(`Tentativo di ripristino ${reconnectAttempts} fra ${delay} ms…`);
+  setStatus("connecting", "ripristino connessione…");
+
+  await new Promise(r => setTimeout(r, delay));
+  if (!pc || isStopping) return;
+
+  try {
+    const offer = await pc.createOffer({ iceRestart: true });
+    await pc.setLocalDescription(offer);
+    send({ type: "offer", room: roomId, sdp: offer });
+    log("Nuova offerta inviata per il ripristino.");
+  } catch (err) {
+    log("Ripristino fallito:", err.message);
+  }
+}
+
 function setLive(live) {
   isLive = live;
   els.tallyBtn.dataset.live = String(live);
@@ -118,6 +215,8 @@ async function start() {
     els.viewfinder.classList.add("is-active");
     updateFacingIndicator();
     setLive(true);
+    startStats();
+    acquireWakeLock();
     els.switchBtn.hidden = false;
     log("Fotocamera attiva:", describeTrack(localStream));
   } catch (err) {
@@ -171,12 +270,67 @@ function cameraError(err) {
   }
 }
 
+function qualityConstraints() {
+  return APP_CONFIG.qualityPresets[currentQuality] || {};
+}
+
 async function openCamera(facingMode) {
   const constraints = {
     audio: false,
-    video: { ...APP_CONFIG.videoConstraints, facingMode: { ideal: facingMode } },
+    video: { ...qualityConstraints(), facingMode: { ideal: facingMode } },
   };
   return navigator.mediaDevices.getUserMedia(constraints);
+}
+
+/**
+ * Cambia risoluzione senza rinegoziare: applyConstraints agisce sulla
+ * traccia già in uso, quindi la connessione WebRTC resta attiva.
+ */
+async function applyQuality(preset) {
+  currentQuality = preset;
+  for (const btn of els.quality.querySelectorAll("button")) {
+    btn.classList.toggle("is-active", btn.dataset.preset === preset);
+  }
+
+  const track = localStream && localStream.getVideoTracks()[0];
+  if (!track) return;
+
+  try {
+    await track.applyConstraints(qualityConstraints());
+    const s = track.getSettings();
+    log(`Qualità impostata su ${preset}: ${s.width}x${s.height}`);
+    matchViewfinderToVideo();
+  } catch (err) {
+    log("Cambio di qualità rifiutato dal dispositivo:", err.message);
+  }
+}
+
+/**
+ * Impedisce il blocco automatico dello schermo durante la trasmissione.
+ * Senza, il sistema sospende la pagina dopo pochi minuti e il flusso
+ * si interrompe: è la causa più comune di cadute a intervallo regolare.
+ */
+async function acquireWakeLock() {
+  if (!APP_CONFIG.keepScreenAwake || !("wakeLock" in navigator)) {
+    if (APP_CONFIG.keepScreenAwake) {
+      log("Wake Lock non supportato: lo schermo potrebbe spegnersi e interrompere il flusso.");
+    }
+    return;
+  }
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    log("Schermo mantenuto acceso durante la trasmissione.");
+    wakeLock.addEventListener("release", () => log("Wake Lock rilasciato."));
+  } catch (err) {
+    log("Wake Lock non ottenuto:", err.message);
+  }
+}
+
+function releaseWakeLock() {
+  if (wakeLock) {
+    wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
 }
 
 function connectSignaling() {
@@ -187,13 +341,23 @@ function connectSignaling() {
 
     let opened = false;
 
+    // La promessa si risolve alla conferma di join, non all'apertura del
+    // socket: il messaggio "joined" può contenere i server ICE, che servono
+    // prima di creare la RTCPeerConnection.
+    const timer = setTimeout(
+      () => reject(new Error("Il signaling server non ha confermato l'ingresso")), 15000);
+
+    onJoined = () => { clearTimeout(timer); resolve(); };
+
     ws.onopen = () => {
       opened = true;
       send({ type: "join", room: roomId, role: "client" });
-      resolve();
     };
 
-    ws.onerror = () => reject(new Error("Impossibile raggiungere il signaling server"));
+    ws.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("Impossibile raggiungere il signaling server"));
+    };
 
     ws.onclose = () => {
       // Solo una connessione che era stata stabilita può dirsi "persa":
@@ -214,7 +378,9 @@ function send(message) {
 }
 
 async function createPeerConnectionAndOffer() {
-  pc = new RTCPeerConnection({ iceServers: APP_CONFIG.iceServers });
+  // I server consegnati dal signaling hanno la precedenza su config.js.
+  const iceServers = serverIceServers || APP_CONFIG.iceServers;
+  pc = new RTCPeerConnection({ iceServers });
 
   localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
@@ -225,11 +391,21 @@ async function createPeerConnectionAndOffer() {
   };
 
   pc.oniceconnectionstatechange = () => {
-    log("Stato connessione ICE:", pc.iceConnectionState);
-    if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+    const state = pc.iceConnectionState;
+    log("Stato connessione ICE:", state);
+
+    if (state === "connected" || state === "completed") {
+      reconnectAttempts = 0;          // il percorso funziona: azzera i tentativi
       setStatus("connected", "in diretta");
-    } else if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
-      setStatus("error", "connessione interrotta");
+    } else if (state === "disconnected") {
+      // Spesso transitorio: WebRTC può recuperare da solo. Si concede
+      // qualche secondo prima di forzare un ripristino.
+      setStatus("connecting", "connessione instabile…");
+      setTimeout(() => {
+        if (pc && pc.iceConnectionState === "disconnected") restartIce();
+      }, 4000);
+    } else if (state === "failed") {
+      restartIce();
     }
   };
 
@@ -243,7 +419,12 @@ async function handleSignalingMessage(msg) {
   switch (msg.type) {
     case "joined":
       log(`Stanza ${msg.room} — bridge già presente: ${msg.peerPresent ? "sì" : "no"}`);
+      if (Array.isArray(msg.iceServers) && msg.iceServers.length) {
+        serverIceServers = msg.iceServers;
+        log(`Server ICE ricevuti dal signaling: ${msg.iceServers.length}`);
+      }
       if (!msg.peerPresent) setStatus("connecting", "in attesa del bridge…");
+      if (onJoined) { onJoined(); onJoined = null; }
       break;
     case "peer-joined":
       log("Il bridge si è collegato");
@@ -292,6 +473,9 @@ async function switchCamera() {
 
 function stop() {
   isStopping = true;
+  reconnectAttempts = 0;
+  stopStats();
+  releaseWakeLock();
   cleanup();
   setLive(false);
   setStatus("idle", "non connesso");
@@ -323,6 +507,19 @@ function cleanup() {
 
 els.preview.addEventListener("loadedmetadata", matchViewfinderToVideo);
 els.preview.addEventListener("resize", matchViewfinderToVideo);
+
+// iOS rilascia il wake lock quando la pagina passa in secondo piano:
+// va richiesto di nuovo al ritorno, altrimenti lo schermo torna a spegnersi.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && isLive && !wakeLock) {
+    acquireWakeLock();
+  }
+});
+
+els.quality.addEventListener("click", (event) => {
+  const btn = event.target.closest("button[data-preset]");
+  if (btn) applyQuality(btn.dataset.preset).catch(err => log("Errore:", err.message));
+});
 
 els.tallyBtn.addEventListener("click", () => toggle().catch(err => log("Errore:", err.message)));
 els.switchBtn.addEventListener("click", () => switchCamera().catch(err => log("Errore cambio camera:", err.message)));

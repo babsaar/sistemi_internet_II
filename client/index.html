@@ -42,7 +42,13 @@
       <span class="tally-label" id="tallyLabel">AVVIA</span>
     </div>
 
-    <p class="room-readout">stanza <b id="roomLabel">—</b></p>
+    <div class="quality" id="quality" role="group" aria-label="Qualità video">
+      <button type="button" data-preset="low">540p</button>
+      <button type="button" data-preset="medium" class="is-active">720p</button>
+      <button type="button" data-preset="high">1080p</button>
+    </div>
+
+    <p class="room-readout">stanza <b id="roomLabel">—</b> · <span id="statsReadout">—</span></p>
 
     <details class="log">
       <summary>registro eventi</summary>
