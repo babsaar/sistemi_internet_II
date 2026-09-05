@@ -384,6 +384,24 @@ async function createPeerConnectionAndOffer() {
 
   localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
+  // Sotto congestione WebRTC preferisce ridurre la risoluzione, cambiandola
+  // di continuo. Per NDI è dannoso: a ogni cambio TouchDesigner ricostruisce
+  // la texture e l'immagine si blocca. Chiediamo quindi di sacrificare i
+  // fotogrammi al secondo mantenendo stabile la risoluzione.
+  const videoSender = pc.getSenders().find(s => s.track && s.track.kind === "video");
+  if (videoSender) {
+    try {
+      const params = videoSender.getParameters();
+      params.degradationPreference = "maintain-resolution";
+      if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+      params.encodings[0].scaleResolutionDownBy = 1;
+      await videoSender.setParameters(params);
+      log("Risoluzione bloccata: in caso di congestione calano i fotogrammi al secondo.");
+    } catch (err) {
+      log("Impossibile bloccare la risoluzione:", err.message);
+    }
+  }
+
   pc.onicecandidate = (event) => {
     if (event.candidate) {
       send({ type: "candidate", room: roomId, candidate: event.candidate });
