@@ -25,7 +25,9 @@ import sys
 import time
 
 import numpy as np
+import queue
 import ssl
+import threading
 import websockets
 from collections import deque
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
@@ -33,10 +35,78 @@ from aiortc.sdp import candidate_from_sdp
 
 log = logging.getLogger("bridge")
 
+# Fotogrammi consecutivi alla stessa dimensione prima di considerarla stabile
+# e rifissare la risoluzione di pubblicazione (circa due secondi a 30 fps).
+STABLE_FRAMES = 60
+
 
 # --------------------------------------------------------------------------
 # Uscita NDI
 # --------------------------------------------------------------------------
+
+class ThreadedSender:
+    """
+    Pubblica i fotogrammi su un thread separato.
+
+    La conversione e l'invio NDI di un fotogramma 720p non sono lavoro
+    trascurabile: eseguirli nel ciclo che riceve dalla rete impedisce di
+    leggere il fotogramma successivo, e il risultato è una cadenza molto
+    inferiore a quella della sorgente.
+
+    La coda è volutamente corta: se il thread resta indietro si scartano i
+    fotogrammi più vecchi invece di accumularli, perché in tempo reale un
+    fotogramma perso costa meno di un ritardo crescente.
+    """
+
+    def __init__(self, output, maxsize=2):
+        self.output = output
+        self.queue = queue.Queue(maxsize=maxsize)
+        self.dropped = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                item = self.queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                return
+            image, fps = item
+            try:
+                self.output.send(image, fps_num=fps, fps_den=1)
+            except Exception as err:
+                log.error("Errore nella pubblicazione NDI: %s", err)
+
+    def submit(self, image, fps=30):
+        try:
+            self.queue.put_nowait((image, fps))
+        except queue.Full:
+            # Scartiamo il più vecchio per fare posto a quello appena arrivato.
+            try:
+                self.queue.get_nowait()
+                self.dropped += 1
+            except queue.Empty:
+                pass
+            try:
+                self.queue.put_nowait((image, fps))
+            except queue.Full:
+                self.dropped += 1
+
+    def reset_counters(self):
+        self.dropped = 0
+
+    def close(self):
+        self._stop.set()
+        try:
+            self.queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._thread.join(timeout=1.0)
+        self.output.close()
+
 
 class NdiOutput:
     """
@@ -139,8 +209,10 @@ def choose_target(width, height, requested):
     if requested and requested.lower() != "auto":
         w, h = requested.lower().split("x")
         return int(w), int(h)
-    # In automatico: 720p nell'orientamento del primo fotogramma ricevuto.
-    return (720, 1280) if height >= width else (1280, 720)
+    # In automatico si pubblica alla dimensione della sorgente: ingrandire
+    # costa lavoro senza aggiungere dettaglio, e la stabilità è garantita
+    # dal criterio di persistenza applicato ai cambi successivi.
+    return width, height
 
 
 def fit_frame(frame, target_w, target_h):
@@ -167,7 +239,7 @@ def fit_frame(frame, target_w, target_h):
     return canvas
 
 
-async def consume_track(track, output, stats):
+async def consume_track(track, sender, stats):
     """
     Legge i fotogrammi dalla traccia WebRTC e li inoltra all'uscita.
 
@@ -184,10 +256,34 @@ async def consume_track(track, output, stats):
             log.info("Traccia terminata (%s).", type(err).__name__)
             return
 
+        source = (frame.width, frame.height)
+
         if stats["target"] is None:
             stats["target"] = choose_target(frame.width, frame.height, stats["requested"])
             log.info("Risoluzione di pubblicazione NDI fissata a %dx%d",
                      stats["target"][0], stats["target"][1])
+
+        # Un cambio deliberato di qualità va seguito; l'adattamento automatico
+        # di WebRTC no, perché oscilla di continuo e cambiare di continuo la
+        # dimensione costringe TouchDesigner a ricostruire la texture.
+        # La distinzione è la persistenza: contiamo i fotogrammi consecutivi
+        # con la stessa dimensione diversa da quella pubblicata.
+        if not stats["fixed"] and source != stats["target"]:
+            if source == stats["pending"]:
+                stats["pending_count"] += 1
+            else:
+                stats["pending"] = source
+                stats["pending_count"] = 1
+
+            if stats["pending_count"] >= STABLE_FRAMES:
+                stats["target"] = source
+                stats["pending"] = None
+                stats["pending_count"] = 0
+                log.info("Risoluzione in ingresso cambiata stabilmente: "
+                         "pubblicazione NDI ora a %dx%d", source[0], source[1])
+        elif source == stats["target"]:
+            stats["pending"] = None
+            stats["pending_count"] = 0
 
         target_w, target_h = stats["target"]
         image = fit_frame(frame, target_w, target_h)
@@ -209,13 +305,21 @@ async def consume_track(track, output, stats):
         stats["frames"] += 1
         stats["width"], stats["height"] = image.shape[1], image.shape[0]
 
-        output.send(image)
+        # Frequenza dichiarata a NDI: quella misurata, non un valore fisso.
+        measured = 30
+        if stats["first_frame_at"]:
+            elapsed_total = time.monotonic() - stats["first_frame_at"]
+            if elapsed_total > 1.0:
+                measured = max(1, min(60, round(stats["frames"] / elapsed_total)))
+        sender.submit(image, measured)
 
         now = time.monotonic()
         if now - last_report >= 5.0:
             elapsed = max(now - stats["first_frame_at"], 1e-6)
-            log.info("Ricevuti %d fotogrammi (%.1f al secondo), risoluzione %dx%d",
-                     stats["frames"], stats["frames"] / elapsed, stats["width"], stats["height"])
+            scartati = f", {sender.dropped} scartati" if sender.dropped else ""
+            log.info("Ricevuti %d fotogrammi (%.1f al secondo), risoluzione %dx%d%s",
+                     stats["frames"], stats["frames"] / elapsed,
+                     stats["width"], stats["height"], scartati)
             last_report = now
 
 
@@ -270,10 +374,12 @@ def ice_servers_from_signaling(entries):
     return servers
 
 
-async def run_session(args, output):
+async def run_session(args, sender):
     stats = {"frames": 0, "width": 0, "height": 0,
              "started": time.monotonic(), "first_frame_at": None,
-             "target": None, "requested": args.ndi_resolution, "last_source": None}
+             "target": None, "requested": args.ndi_resolution, "last_source": None,
+             "pending": None, "pending_count": 0,
+             "fixed": bool(args.ndi_resolution and args.ndi_resolution.lower() != "auto")}
     finished = asyncio.Event()
     pc = None
 
@@ -284,7 +390,7 @@ async def run_session(args, output):
         @pc.on("track")
         def on_track(track):
             if track.kind == "video":
-                asyncio.ensure_future(consume_track(track, output, stats))
+                asyncio.ensure_future(consume_track(track, sender, stats))
 
         @pc.on("connectionstatechange")
         async def on_state_change():
@@ -404,10 +510,12 @@ async def run_session(args, output):
 
 async def main_loop(args):
     output = DryRunOutput(args.ndi_name) if args.dry_run else NdiOutput(args.ndi_name)
+    sender = ThreadedSender(output)
     try:
         while True:
             try:
-                await run_session(args, output)
+                sender.reset_counters()
+                await run_session(args, sender)
             except (OSError, asyncio.TimeoutError,
                     websockets.exceptions.WebSocketException) as err:
                 detail = str(err) or type(err).__name__
@@ -424,7 +532,7 @@ async def main_loop(args):
             log.info("Nuovo tentativo tra %d secondi…", args.retry)
             await asyncio.sleep(args.retry)
     finally:
-        output.close()
+        sender.close()
 
 
 def parse_args(argv=None):
@@ -444,7 +552,8 @@ def parse_args(argv=None):
     p.add_argument("--turn-password", help="Password TURN")
     p.add_argument("--ndi-resolution", default="auto",
                    help="Risoluzione fissa pubblicata su NDI, es. 1280x720. "
-                        "Con 'auto' usa 720p nell'orientamento del primo fotogramma.")
+                        "Con 'auto' segue la risoluzione della sorgente, "
+                        "cambiandola solo quando resta stabile.")
     p.add_argument("--insecure", action="store_true",
                    help="Accetta certificati TLS autofirmati: serve in modalità "
                         "locale, dove il server usa un certificato di sviluppo.")
