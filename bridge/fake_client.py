@@ -17,6 +17,7 @@ import json
 import logging
 
 import numpy as np
+import ssl
 import websockets
 from av import VideoFrame
 from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription
@@ -57,7 +58,14 @@ async def run(args):
         iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]))
     pc.addTrack(SyntheticVideoTrack())
 
-    async with websockets.connect(args.signaling, origin=args.origin) as ws:
+    tls = {}
+    if args.signaling.startswith("wss://") and args.insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        tls = {"ssl": ctx}      # omesso del tutto quando non serve
+
+    async with websockets.connect(args.signaling, origin=args.origin, **tls) as ws:
         await ws.send(json.dumps({"type": "join", "room": args.room, "role": "client"}))
         log.info("Entrato nella stanza %s", args.room)
 
@@ -117,6 +125,8 @@ if __name__ == "__main__":
     p.add_argument("--signaling", required=True)
     p.add_argument("--room", required=True)
     p.add_argument("--origin", default="https://babsaar.github.io")
+    p.add_argument("--insecure", action="store_true",
+                   help="Accetta certificati autofirmati (modalità locale)")
     p.add_argument("--seconds", type=int, default=8)
     p.add_argument("--timeout", type=int, default=20)
     args = p.parse_args()

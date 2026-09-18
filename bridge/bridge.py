@@ -25,7 +25,9 @@ import sys
 import time
 
 import numpy as np
+import ssl
 import websockets
+from collections import deque
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 from aiortc.sdp import candidate_from_sdp
 
@@ -68,14 +70,36 @@ class NdiOutput:
             raise SystemExit("Creazione della sorgente NDI fallita.")
 
         self.frame = ndi.VideoFrameV2()
+
+        # L'invio NDI è asincrono: la libreria continua a leggere la memoria
+        # del fotogramma dopo il ritorno della chiamata. Senza trattenere un
+        # riferimento, Python libererebbe l'array mentre NDI lo sta ancora
+        # usando, con il risultato di un'immagine congelata o corrotta.
+        # Manteniamo quindi in vita gli ultimi fotogrammi inviati.
+        self._in_flight = deque(maxlen=3)
+
         log.info("Sorgente NDI pubblicata con il nome '%s'", name)
 
     def send(self, image, fps_num=30, fps_den=1):
         """image: array numpy BGRA di forma (altezza, larghezza, 4)."""
+        self._in_flight.append(image)          # vedi commento nel costruttore
+
+        height, width = image.shape[0], image.shape[1]
         self.frame.data = image
         self.frame.FourCC = self.ndi.FOURCC_VIDEO_TYPE_BGRX
         self.frame.frame_rate_N = fps_num
         self.frame.frame_rate_D = fps_den
+
+        # Alcune versioni dei binding ricavano queste informazioni dall'array,
+        # altre no: le impostiamo se disponibili, senza dare per scontato che
+        # gli attributi esistano.
+        for attr, value in (("xres", width), ("yres", height),
+                            ("line_stride_in_bytes", width * 4)):
+            try:
+                setattr(self.frame, attr, value)
+            except AttributeError:
+                pass
+
         self.ndi.send_send_video_v2(self.sender, self.frame)
 
     def close(self):
@@ -103,6 +127,46 @@ class DryRunOutput:
 # Ricezione del flusso video
 # --------------------------------------------------------------------------
 
+def choose_target(width, height, requested):
+    """
+    Determina la risoluzione fissa da pubblicare su NDI.
+
+    WebRTC adatta di continuo la dimensione del video alla banda: per NDI
+    questo è un problema, perché a ogni cambio TouchDesigner deve ricostruire
+    la texture e l'immagine si blocca. Pubblichiamo quindi sempre alla stessa
+    risoluzione, scalando i fotogrammi in ingresso.
+    """
+    if requested and requested.lower() != "auto":
+        w, h = requested.lower().split("x")
+        return int(w), int(h)
+    # In automatico: 720p nell'orientamento del primo fotogramma ricevuto.
+    return (720, 1280) if height >= width else (1280, 720)
+
+
+def fit_frame(frame, target_w, target_h):
+    """
+    Scala il fotogramma dentro le dimensioni di destinazione mantenendo le
+    proporzioni, completando con nero le bande eventualmente mancanti.
+    Restituisce un array BGRA contiguo, pronto per NDI.
+    """
+    src_w, src_h = frame.width, frame.height
+    ratio = min(target_w / src_w, target_h / src_h)
+    new_w = max(2, int(src_w * ratio) & ~1)      # dimensioni pari: swscale le preferisce
+    new_h = max(2, int(src_h * ratio) & ~1)
+
+    scaled = frame.reformat(width=new_w, height=new_h, format="bgra").to_ndarray()
+
+    if new_w == target_w and new_h == target_h:
+        return np.ascontiguousarray(scaled)
+
+    canvas = np.zeros((target_h, target_w, 4), dtype=np.uint8)
+    canvas[:, :, 3] = 255
+    top = (target_h - new_h) // 2
+    left = (target_w - new_w) // 2
+    canvas[top:top + new_h, left:left + new_w] = scaled
+    return canvas
+
+
 async def consume_track(track, output, stats):
     """
     Legge i fotogrammi dalla traccia WebRTC e li inoltra all'uscita.
@@ -120,19 +184,32 @@ async def consume_track(track, output, stats):
             log.info("Traccia terminata (%s).", type(err).__name__)
             return
 
-        image = frame.to_ndarray(format="bgra")
+        if stats["target"] is None:
+            stats["target"] = choose_target(frame.width, frame.height, stats["requested"])
+            log.info("Risoluzione di pubblicazione NDI fissata a %dx%d",
+                     stats["target"][0], stats["target"][1])
+
+        target_w, target_h = stats["target"]
+        image = fit_frame(frame, target_w, target_h)
+
+        # La dimensione in ingresso cambia di continuo per adattamento alla
+        # banda: la registriamo solo per diagnosi, l'uscita resta costante.
+        if (frame.width, frame.height) != stats.get("last_source"):
+            stats["last_source"] = (frame.width, frame.height)
+            log.debug("Dimensione in ingresso: %dx%d", frame.width, frame.height)
 
         if stats["frames"] == 0:
             # Il conteggio parte dal primo fotogramma: includere l'attesa
             # della connessione falserebbe la misura dei fotogrammi al secondo.
             stats["first_frame_at"] = time.monotonic()
             last_report = stats["first_frame_at"]
-            log.info("Primo fotogramma: %dx%d", image.shape[1], image.shape[0])
+            log.info("Primo fotogramma ricevuto a %dx%d, pubblicato a %dx%d",
+                     frame.width, frame.height, image.shape[1], image.shape[0])
 
         stats["frames"] += 1
         stats["width"], stats["height"] = image.shape[1], image.shape[0]
 
-        output.send(np.ascontiguousarray(image))
+        output.send(image)
 
         now = time.monotonic()
         if now - last_report >= 5.0:
@@ -145,6 +222,27 @@ async def consume_track(track, output, stats):
 # --------------------------------------------------------------------------
 # Sessione: signaling + connessione WebRTC
 # --------------------------------------------------------------------------
+
+def tls_options(url, insecure):
+    """
+    Opzioni TLS per il collegamento al signaling.
+
+    In modalità locale il server usa un certificato autofirmato: il browser
+    permette di accettarlo manualmente, Python no. Con --insecure la verifica
+    viene disattivata, cosa accettabile solo perché il server è la propria
+    macchina in rete locale.
+
+    Restituisce un dizionario da espandere nella chiamata: passare ssl=None
+    a un indirizzo wss:// verrebbe rifiutato dalla libreria, quindi quando
+    non serve nulla l'argomento va omesso del tutto.
+    """
+    if not url.startswith("wss://") or not insecure:
+        return {}
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return {"ssl": ctx}
+
 
 def ice_servers_from_args(args):
     """Server ICE indicati a riga di comando."""
@@ -174,7 +272,8 @@ def ice_servers_from_signaling(entries):
 
 async def run_session(args, output):
     stats = {"frames": 0, "width": 0, "height": 0,
-             "started": time.monotonic(), "first_frame_at": None}
+             "started": time.monotonic(), "first_frame_at": None,
+             "target": None, "requested": args.ndi_resolution, "last_source": None}
     finished = asyncio.Event()
     pc = None
 
@@ -206,7 +305,8 @@ async def run_session(args, output):
     # dopo un periodo di inattività e il primo collegamento deve attendere
     # il risveglio, che può richiedere un minuto abbondante.
     async with websockets.connect(args.signaling, origin=args.origin,
-                                  open_timeout=args.connect_timeout) as ws:
+                                  open_timeout=args.connect_timeout,
+                                  **tls_options(args.signaling, args.insecure)) as ws:
         await ws.send(json.dumps({"type": "join", "room": args.room, "role": "bridge"}))
         log.info("Entrato nella stanza %s in attesa del telefono…", args.room)
 
@@ -268,9 +368,17 @@ async def run_session(args, output):
                         log.debug("Candidato ICE scartato: %s", err)
 
                 elif kind == "peer-left":
-                    log.info("Il telefono si è disconnesso.")
-                    finished.set()
-                    return
+                    # Il canale di segnalazione si è chiuso. A connessione già
+                    # stabilita il video viaggia direttamente fra i due peer e
+                    # il signaling non serve più: chiudere qui interromperebbe
+                    # una trasmissione perfettamente funzionante.
+                    if pc is not None and pc.connectionState == "connected":
+                        log.info("Canale di segnalazione chiuso, ma il flusso video "
+                                 "prosegue: la sessione resta attiva.")
+                    else:
+                        log.info("Il telefono si è disconnesso.")
+                        finished.set()
+                        return
 
                 elif kind == "error":
                     log.error("Errore dal signaling server: %s", msg.get("message"))
@@ -304,8 +412,12 @@ async def main_loop(args):
                     websockets.exceptions.WebSocketException) as err:
                 detail = str(err) or type(err).__name__
                 log.warning("Signaling non raggiungibile: %s", detail)
-                log.warning("Se il servizio è ospitato su un piano gratuito potrebbe "
-                            "essere sospeso: il risveglio richiede fino a un minuto.")
+                if isinstance(err, asyncio.TimeoutError):
+                    log.warning("Se il servizio è ospitato su un piano gratuito potrebbe "
+                                "essere sospeso: il risveglio richiede fino a un minuto.")
+                elif "CERTIFICATE_VERIFY_FAILED" in detail:
+                    log.warning("Certificato non verificabile: in modalità locale "
+                                "aggiungere l'opzione --insecure.")
 
             if args.once:
                 return
@@ -330,6 +442,12 @@ def parse_args(argv=None):
     p.add_argument("--turn", help="URL del server TURN, es. turn:host:3478")
     p.add_argument("--turn-user", help="Utente TURN")
     p.add_argument("--turn-password", help="Password TURN")
+    p.add_argument("--ndi-resolution", default="auto",
+                   help="Risoluzione fissa pubblicata su NDI, es. 1280x720. "
+                        "Con 'auto' usa 720p nell'orientamento del primo fotogramma.")
+    p.add_argument("--insecure", action="store_true",
+                   help="Accetta certificati TLS autofirmati: serve in modalità "
+                        "locale, dove il server usa un certificato di sviluppo.")
     p.add_argument("--dry-run", action="store_true",
                    help="Non pubblica su NDI: utile per verificare signaling e WebRTC")
     p.add_argument("--once", action="store_true",

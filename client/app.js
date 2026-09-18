@@ -120,6 +120,7 @@ function startStats() {
   let lastAt = 0;
 
   statsTimer = setInterval(async () => {
+    ensureWakeLock();
     if (!pc) return;
     const report = await pc.getStats();
     let bytes = 0, lost = 0, w = 0, h = 0, fps = 0;
@@ -320,9 +321,32 @@ async function acquireWakeLock() {
   try {
     wakeLock = await navigator.wakeLock.request("screen");
     log("Schermo mantenuto acceso durante la trasmissione.");
-    wakeLock.addEventListener("release", () => log("Wake Lock rilasciato."));
+
+    // Il sistema può riprendersi il permesso in qualsiasi momento (passaggio
+    // in secondo piano, risparmio energetico). Se accade mentre stiamo ancora
+    // trasmettendo e la pagina è visibile, lo richiediamo subito: senza questo
+    // lo schermo si spegne e la pagina viene sospesa, interrompendo il flusso.
+    wakeLock.addEventListener("release", () => {
+      log("Wake Lock rilasciato dal sistema.");
+      wakeLock = null;
+      if (isLive && !isStopping && document.visibilityState === "visible") {
+        setTimeout(() => { if (!wakeLock) acquireWakeLock(); }, 1000);
+      }
+    });
   } catch (err) {
     log("Wake Lock non ottenuto:", err.message);
+    log("Se il risparmio energetico è attivo, disattivarlo o impostare il "
+        + "blocco automatico dello schermo su Mai.");
+  }
+}
+
+/**
+ * Rete di sicurezza: se il permesso è andato perso senza che l'evento di
+ * rilascio ci sia arrivato, lo recuperiamo al controllo periodico.
+ */
+function ensureWakeLock() {
+  if (isLive && !isStopping && !wakeLock && document.visibilityState === "visible") {
+    acquireWakeLock();
   }
 }
 
