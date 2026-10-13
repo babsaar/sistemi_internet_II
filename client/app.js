@@ -47,6 +47,9 @@ let localStream = null;
 let currentFacingMode = "environment";
 let isStopping = false;
 let isLive = false;
+let signalingPending = null;    // connessione al signaling in corso, se c'è
+let signalingRetry = null;      // timer del prossimo ricollegamento
+let signalingAttempts = 0;
 
 // La stanza può arrivare da un QR code (?room=1234, vedi host.html):
 // se presente in URL, sovrascrive il valore di default in config.js.
@@ -179,6 +182,16 @@ async function restartIce() {
 
   await new Promise(r => setTimeout(r, delay));
   if (!pc || isStopping) return;
+
+  // La nuova offerta viaggia sul signaling: se il canale è caduto va
+  // riaperto prima, altrimenti l'offerta andrebbe persa senza errori.
+  try {
+    await ensureSignaling();
+  } catch (err) {
+    log("Signaling non raggiungibile, ripristino rimandato:", err.message);
+    scheduleSignalingReconnect();
+    return;
+  }
 
   try {
     const offer = await pc.createOffer({ iceRestart: true });
@@ -387,14 +400,64 @@ function connectSignaling() {
       // Solo una connessione che era stata stabilita può dirsi "persa":
       // altrimenti il messaggio sovrascriverebbe l'errore più preciso
       // già mostrato da chi ha chiamato questa funzione.
-      if (!isStopping && opened) {
+      if (isStopping || !opened) return;
+
+      if (isMediaConnected()) {
+        // A trasmissione avviata il video viaggia direttamente fra telefono
+        // e bridge: il signaling serve solo per un eventuale ripristino.
+        // Non è un errore, e la diretta non va segnalata come persa.
+        log("Canale di segnalazione chiuso: il video prosegue, ricollegamento in sottofondo.");
+      } else {
         log("Connessione al signaling server chiusa inaspettatamente");
         setStatus("error", "connessione persa");
       }
+      scheduleSignalingReconnect();
     };
 
     ws.onmessage = (event) => handleSignalingMessage(JSON.parse(event.data));
   });
+}
+
+function isMediaConnected() {
+  return !!pc && (pc.iceConnectionState === "connected" ||
+                  pc.iceConnectionState === "completed");
+}
+
+/** Apre il signaling solo se non è già aperto o in apertura. */
+function ensureSignaling() {
+  if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve();
+  if (!signalingPending) {
+    signalingPending = connectSignaling().finally(() => { signalingPending = null; });
+  }
+  return signalingPending;
+}
+
+/**
+ * Riapre il canale di segnalazione dopo una chiusura, con attese
+ * crescenti (1, 2, 4… fino a 15 secondi). Il video non viene toccato:
+ * si rientra nella stanza senza inviare una nuova offerta.
+ */
+function scheduleSignalingReconnect() {
+  if (signalingRetry || isStopping || !isLive) return;
+  const delay = Math.min(1000 * 2 ** signalingAttempts, 15000);
+  signalingAttempts += 1;
+  signalingRetry = setTimeout(async () => {
+    signalingRetry = null;
+    if (isStopping || !isLive) return;
+    try {
+      await ensureSignaling();
+      signalingAttempts = 0;
+      log("Canale di segnalazione ripristinato.");
+      // Se nel frattempo il percorso video si è interrotto, il ripristino
+      // ora ha di nuovo un canale su cui viaggiare.
+      if (pc && ["disconnected", "failed"].includes(pc.iceConnectionState)) {
+        restartIce();
+      }
+    } catch (err) {
+      log("Ricollegamento al signaling fallito:", err.message);
+      scheduleSignalingReconnect();
+    }
+  }, delay);
 }
 
 function send(message) {
@@ -412,8 +475,8 @@ async function createPeerConnectionAndOffer() {
   // mantenere la risoluzione a ogni costo fa crollare i fotogrammi al secondo
   // fino a pochi al secondo, che per un video dal vivo è inaccettabile.
   // Lasciamo quindi il compromesso bilanciato: la stabilità di cui ha bisogno
-  // TouchDesigner è garantita dal bridge, che segue solo i cambi di
-  // risoluzione persistenti e ignora le oscillazioni momentanee.
+  // TouchDesigner è garantita dal bridge, che pubblica su NDI sempre alla
+  // stessa risoluzione qualunque sia quella in ingresso.
   const videoSender = pc.getSenders().find(s => s.track && s.track.kind === "video");
   if (videoSender) {
     try {
@@ -465,7 +528,10 @@ async function handleSignalingMessage(msg) {
         serverIceServers = msg.iceServers;
         log(`Server ICE ricevuti dal signaling: ${msg.iceServers.length}`);
       }
-      if (!msg.peerPresent) setStatus("connecting", "in attesa del bridge…");
+      // Un rientro nella stanza a video già connesso non cambia lo stato.
+      if (!msg.peerPresent && !isMediaConnected()) {
+        setStatus("connecting", "in attesa del bridge…");
+      }
       if (onJoined) { onJoined(); onJoined = null; }
       break;
     case "peer-joined":
@@ -483,8 +549,14 @@ async function handleSignalingMessage(msg) {
       }
       break;
     case "peer-left":
-      log("Il bridge si è disconnesso");
-      setStatus("error", "bridge disconnesso");
+      // Stesso caso, visto dall'altro lato: se il video arriva ancora,
+      // si è chiuso solo il signaling del bridge, che si ricollega da sé.
+      if (isMediaConnected()) {
+        log("Il bridge ha chiuso il signaling, il video prosegue");
+      } else {
+        log("Il bridge si è disconnesso");
+        setStatus("error", "bridge disconnesso");
+      }
       break;
     case "error":
       log("Errore dal signaling server:", msg.message);
@@ -516,6 +588,9 @@ async function switchCamera() {
 function stop() {
   isStopping = true;
   reconnectAttempts = 0;
+  clearTimeout(signalingRetry);
+  signalingRetry = null;
+  signalingAttempts = 0;
   stopStats();
   releaseWakeLock();
   cleanup();
