@@ -73,24 +73,39 @@ function setStatus(state, label) {
   els.statusLabel.textContent = label;
 }
 
-function resolveSignalingUrl() {
-  if (APP_CONFIG.signalingUrl) return APP_CONFIG.signalingUrl;
+let sameHostSignaling;   // undefined finché non è stato verificato
 
-  // Senza signalingUrl esplicito l'indirizzo viene dedotto dall'host corrente.
-  // Ha senso solo in sviluppo locale: su un hosting statico (GitHub Pages)
-  // non esiste alcun WebSocket da contattare, quindi conviene dirlo subito
-  // invece di lasciar fallire la connessione con un errore generico.
+async function resolveSignalingUrl() {
   const isLocal = ["localhost", "127.0.0.1"].includes(location.hostname) ||
+                  /\.local$/.test(location.hostname) ||
                   /^192\.168\.|^10\.|^172\.(1[6-9]|2\d|3[01])\./.test(location.hostname);
+  const sameHost = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`;
 
-  if (!isLocal) {
-    const err = new Error("Signaling server non configurato");
-    err.code = "SIGNALING_NOT_CONFIGURED";
-    throw err;
+  // Modalità locale: se la pagina arriva dal server del Mac, quello stesso
+  // server fa anche da signaling, qualunque cosa dica config.js. Così la
+  // modalità online e quella locale usano lo stesso config.js senza modifiche.
+  // Il server locale si riconosce dall'endpoint /_lan, che solo lui espone.
+  if (isLocal) {
+    if (sameHostSignaling === undefined) {
+      try {
+        const res = await fetch("/_lan", { cache: "no-store" });
+        sameHostSignaling = res.ok;
+      } catch {
+        sameHostSignaling = false;
+      }
+    }
+    if (sameHostSignaling) return sameHost;
   }
 
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${location.host}/ws`;
+  if (APP_CONFIG.signalingUrl) return APP_CONFIG.signalingUrl;
+  if (isLocal) return sameHost;
+
+  // Su un hosting statico (GitHub Pages) non esiste alcun WebSocket da
+  // contattare: conviene dirlo subito invece di lasciar fallire la
+  // connessione con un errore generico.
+  const err = new Error("Signaling server non configurato");
+  err.code = "SIGNALING_NOT_CONFIGURED";
+  throw err;
 }
 
 /**
@@ -370,9 +385,9 @@ function releaseWakeLock() {
   }
 }
 
-function connectSignaling() {
+async function connectSignaling() {
+  const url = await resolveSignalingUrl();
   return new Promise((resolve, reject) => {
-    const url = resolveSignalingUrl();
     log("Connessione al signaling server:", url);
     ws = new WebSocket(url);
 
